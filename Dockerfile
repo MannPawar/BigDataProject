@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # Install Java (required by H2O) and system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends default-jre-headless && \
+    apt-get install -y --no-install-recommends default-jre-headless curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set JAVA_HOME
@@ -23,16 +23,11 @@ COPY --chown=user:user . .
 # Switch to non-root user
 USER user
 
-# Expose Streamlit port
+# Expose Dash port
 EXPOSE 7860
 
 # Health check
-HEALTHCHECK CMD curl --fail http://localhost:7860/_stcore/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:7860/ || exit 1
 
-# Run Streamlit on HF Spaces port
-CMD ["streamlit", "run", "app.py", \
-     "--server.port=7860", \
-     "--server.address=0.0.0.0", \
-     "--server.headless=true", \
-     "--browser.gatherUsageStats=false", \
-     "--server.fileWatcherType=none"]
+# Run Dash app
+CMD ["python", "app.py"]

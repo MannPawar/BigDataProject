@@ -1,10 +1,9 @@
-streamlit>=1.30
-pandas
+dash
 plotly
+pandas
 h2o
 google-cloud-pubsub
 google-auth
 requests
-openpyxl
 protobuf
 gtfs-realtime-bindings

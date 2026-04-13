@@ -1,17 +1,9 @@
 """
 BART Footfall Intelligence Dashboard
 =====================================
-Consolidated Streamlit app for Hugging Face Spaces deployment.
+Consolidated Dash app for Hugging Face Spaces deployment.
 Combines publisher (511.org poller), subscriber (Pub/Sub + H2O ML),
 and dashboard UI into a single process with background threads.
-
-Optimizations vs. original multi-script pipeline:
-  - Cached H2O model (survives Streamlit reruns)
-  - Prediction caching (avoids redundant H2O calls within same minute)
-  - Lazy imports for faster cold-start
-  - Memory-limited H2O cluster (max 4G)
-  - Station coordinate lookup uses fallback data (avoids 50+ API calls)
-  - GTFS-RT parsed directly to avoid extra Pub/Sub round-trip in demo mode
 """
 
 import os
@@ -25,20 +17,11 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
-import streamlit as st
+import plotly.graph_objects as go
+from dash import Dash, html, dcc, dash_table, Input, Output, callback
 
 # ============================================================
-# 1. Page Config (must be first Streamlit call)
-# ============================================================
-st.set_page_config(
-    page_title="BART Footfall Intelligence",
-    page_icon="🚇",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ============================================================
-# 2. Constants
+# 1. Constants & Station Data
 # ============================================================
 BART_STATIONS = [
     {"name": "12th St. Oakland City Center", "abbr": "12TH", "lat": 37.803664, "lon": -122.271604},
@@ -62,6 +45,8 @@ BART_STATIONS = [
     {"name": "Embarcadero", "abbr": "EMBR", "lat": 37.792976, "lon": -122.397022},
     {"name": "Fremont", "abbr": "FRMT", "lat": 37.557465, "lon": -121.976608},
     {"name": "Fruitvale", "abbr": "FTVL", "lat": 37.774836, "lon": -122.224175},
+    {"name": "Hayward", "abbr": "HAYW", "lat": 37.670399, "lon": -122.086143},
+    {"name": "Colma", "abbr": "COLM", "lat": 37.684638, "lon": -122.466233},
     {"name": "Glen Park", "abbr": "GLEN", "lat": 37.732888, "lon": -122.43402},
     {"name": "Lafayette", "abbr": "LAFY", "lat": 37.893394, "lon": -122.123801},
     {"name": "Lake Merritt", "abbr": "LAKE", "lat": 37.797484, "lon": -122.265609},
@@ -97,11 +82,71 @@ STATION_ALIAS_MAP = {
     "downtownberkeley": "DBRK", "northberkeley": "NBRK",
     "unioncity": "UCTY", "warmsprings": "WARM",
     "warmspringssouthfremont": "WARM", "berryessa": "BERY",
-    "millbrae": "MLBR",
+    "berryessanorthsanjose": "BERY", "milpitas": "MLPT",
+    "millbrae": "MLBR", "pittsburgcenter": "PCTR", "pittsburgbaypoint": "PITT",
+    "northconcord": "NCON", "pleasanthill": "PHIL", "bayfair": "BAYF",
+    "coliseum": "COLS", "sanleandro": "SANL", "southhayward": "SHAY",
+    "hayward": "HAYW", "fremont": "FRMT"
+}
+
+# Complete mapping of BART's internal 2-letter ridership codes → 4-letter GTFS abbreviations.
+# The ridership CSV uses these 2-letter codes, which don't match station names or GTFS abbrs.
+# This map is why only ~25/50 stations were matching previously.
+BART_2LETTER_TO_ABBR = {
+    "12": "12TH",  # 12th St. Oakland City Center
+    "16": "16TH",  # 16th St. Mission
+    "19": "19TH",  # 19th St. Oakland
+    "24": "24TH",  # 24th St. Mission
+    "AN": "ANTC",  # Antioch
+    "AS": "ASHB",  # Ashby
+    "BE": "BERY",  # Berryessa/North San Jose
+    "BF": "BAYF",  # Bay Fair
+    "BK": "DBRK",  # Downtown Berkeley
+    "BP": "BALB",  # Balboa Park
+    "CC": "CIVC",  # Civic Center/UN Plaza
+    "CL": "COLS",  # Coliseum
+    "CM": "COLM",  # Colma
+    "CN": "CONC",  # Concord
+    "CV": "CAST",  # Castro Valley
+    "DC": "DALY",  # Daly City
+    "ED": "DELN",  # El Cerrito del Norte
+    "EM": "EMBR",  # Embarcadero
+    "EN": "PITT",  # Pittsburg/Bay Point
+    "EP": "PLZA",  # El Cerrito Plaza
+    "FM": "FRMT",  # Fremont
+    "FV": "FTVL",  # Fruitvale
+    "GP": "GLEN",  # Glen Park
+    "HY": "HAYW",  # Hayward
+    "LF": "LAFY",  # Lafayette
+    "LM": "LAKE",  # Lake Merritt
+    "MA": "MCAR",  # MacArthur
+    "MB": "MLBR",  # Millbrae
+    "ML": "MLPT",  # Milpitas
+    "MT": "MONT",  # Montgomery St.
+    "NB": "NBRK",  # North Berkeley
+    "NC": "NCON",  # North Concord/Martinez
+    "OA": "OAKL",  # Oakland International Airport
+    "OR": "ORIN",  # Orinda
+    "OW": "WOAK",  # West Oakland
+    "PC": "PCTR",  # Pittsburg Center
+    "PH": "PHIL",  # Pleasant Hill
+    "PL": "POWL",  # Powell St.
+    "RM": "RICH",  # Richmond
+    "RR": "ROCK",  # Rockridge
+    "SB": "SBRN",  # San Bruno
+    "SH": "SHAY",  # South Hayward
+    "SL": "SANL",  # San Leandro
+    "SO": "SSAN",  # South San Francisco
+    "SS": "SFIA",  # San Francisco International Airport (SFO)
+    "UC": "UCTY",  # Union City
+    "WC": "WCRK",  # Walnut Creek
+    "WD": "WDUB",  # West Dublin/Pleasanton
+    "WP": "WARM",  # Warm Springs/South Fremont
+    "WS": "DUBL",  # Dublin/Pleasanton
 }
 
 # ============================================================
-# 3. Thread-Safe Global State
+# 2. Thread-Safe Global State
 # ============================================================
 class GlobalState:
     def __init__(self):
@@ -109,20 +154,21 @@ class GlobalState:
         self.vehicles = {}
         self.stations_payload = []
         self.last_update = None
-        self.day_type = ""
-        self.month = 0
+        self.day_type = "Unknown"
+        self.month = 1
         self.vehicle_count = 0
         self.total_traffic = 0
         self.total_predicted = 0.0
         self.status = "initializing"
-        self.status_detail = "Starting up..."
+        self.status_detail = "Initializing..."
+        self.agencies = {}
 
     def set_status(self, status, detail=""):
         with self.lock:
             self.status = status
             self.status_detail = detail
 
-    def update(self, vehicles, stations, day_type, month):
+    def update(self, vehicles, stations, day_type, month, agencies=None):
         with self.lock:
             self.vehicles = {v["vehicle_id"]: v for v in vehicles}
             self.stations_payload = stations
@@ -132,7 +178,9 @@ class GlobalState:
             self.total_traffic = sum(s.get("live_traffic_count", 0) for s in stations)
             self.total_predicted = sum(s.get("predicted_ridership", 0) for s in stations)
             self.last_update = dt.datetime.now(dt.timezone.utc)
-            self.status = "running"
+            self.status = "running" if len(vehicles) > 0 else "running (no live data)"
+            if agencies is not None:
+                self.agencies = agencies
 
     def snapshot(self):
         with self.lock:
@@ -147,14 +195,13 @@ class GlobalState:
                 "last_update": self.last_update,
                 "status": self.status,
                 "status_detail": self.status_detail,
+                "agencies": dict(self.agencies),
             }
 
-@st.cache_resource
-def get_state():
-    return GlobalState()
+STATE = GlobalState()
 
 # ============================================================
-# 4. Utility Helpers
+# 3. Utility Helpers
 # ============================================================
 def _norm(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
@@ -171,383 +218,455 @@ def _day_type(now):
     return "Average Sunday"
 
 def _get_credentials():
-    """Load GCP credentials from Streamlit secrets or local file."""
     try:
         from google.oauth2 import service_account
-        if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-            info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
-            return service_account.Credentials.from_service_account_info(info)
+        gcp_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
+        if gcp_json:
+            return service_account.Credentials.from_service_account_info(json.loads(gcp_json))
         if Path("admin-key.json").exists():
             return service_account.Credentials.from_service_account_file("admin-key.json")
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def _build_station_lookup(origins):
-    """Map ridership origin names to BART station coordinates."""
     by_name = {_norm(s["name"]): s for s in BART_STATIONS}
     by_abbr = {_norm(s["abbr"]): s for s in BART_STATIONS}
     lookup = {}
+    unmatched = []
     for origin in origins:
         key = _norm(origin)
-        stn = by_name.get(key) or by_abbr.get(key)
+        stn = None
+        # 1. Try BART 2-letter internal code map first (covers all 50 ridership CSV codes)
+        if origin.upper() in BART_2LETTER_TO_ABBR:
+            stn = by_abbr.get(_norm(BART_2LETTER_TO_ABBR[origin.upper()]))
+        # 2. Exact match on full name or abbreviation
+        if stn is None:
+            stn = by_name.get(key) or by_abbr.get(key)
+        # 3. Known alias map
         if stn is None and key in STATION_ALIAS_MAP:
             stn = by_abbr.get(_norm(STATION_ALIAS_MAP[key]))
+        # 4. Loose containment match (last resort)
         if stn is None:
             for nk, s in by_name.items():
                 if key in nk or nk in key:
-                    stn = s
-                    break
+                    stn = s; break
         if stn:
             lookup[origin] = stn
+        else:
+            unmatched.append(origin)
+    if unmatched:
+        print(f"[station_lookup] Could not match {len(unmatched)} origins: {unmatched}")
+    print(f"[station_lookup] Matched {len(lookup)}/{len(origins)} origins to stations.")
     return lookup
 
 def _nearest_station(lat, lon):
     best, best_km = None, 1e9
     for s in BART_STATIONS:
         km = _haversine(lat, lon, s["lat"], s["lon"])
-        if km < best_km:
-            best, best_km = s, km
+        if km < best_km: best, best_km = s, km
     return best, best_km
 
 # ============================================================
-# 5. Background Pipeline Worker
+# 4. Background Pipeline Worker
 # ============================================================
-def _pipeline_worker(state: GlobalState):
-    """
-    Single background thread that handles:
-      1. GTFS-RT polling from 511.org
-      2. Publishing to Pub/Sub
-      3. Subscribing to Pub/Sub for vehicle positions
-      4. H2O model training & prediction
-      5. Snapshot building
-    """
-    import requests
-    import h2o
+def _pipeline_worker():
+    import requests, h2o
     from h2o.automl import H2OAutoML
+    from google.cloud import pubsub_v1
+    from google.transit import gtfs_realtime_pb2
 
-    # --- Config from secrets with fallbacks ---
-    api_key = st.secrets.get("API_511_KEY", "706e23ec-449e-4a65-b12e-1372b6b553e4")
-    project_id = st.secrets.get("GCP_PROJECT_ID", "bigdataproject-493002")
-    topic_id = st.secrets.get("GCP_TOPIC_ID", "transit-realtime-data")
-    sub_id = st.secrets.get("GCP_SUBSCRIPTION_ID", "transit-realtime-data-sub")
-
+    # Config
+    api_key = os.environ.get("API_511_KEY", "706e23ec-449e-4a65-b12e-1372b6b553e4")
+    project_id = os.environ.get("GCP_PROJECT_ID", "bigdataproject-493002")
+    topic_id = os.environ.get("GCP_TOPIC_ID", "transit-realtime-data")
+    sub_id = os.environ.get("GCP_SUBSCRIPTION_ID", "transit-realtime-data-sub")
+    
     creds = _get_credentials()
-    vehicles = {}  # vehicle_id -> record
-    prediction_cache = {}  # (day_type, month) -> {origin: value}
+    vehicles = {}
+    prediction_cache = {}
     model = None
-    default_dest_map = {}
-    global_dest = ""
     station_lookup = {}
+    default_dest_map = {}
+    global_dest = "Embarcadero"
+    
+    # Lock for thread-safe access to vehicles dict
+    vehicles_lock = threading.Lock()
 
-    # ── Step 1: Initialize H2O & train model ──
-    state.set_status("initializing", "Starting H2O cluster...")
+    # H2O Setup
+    STATE.set_status("initializing", "Starting H2O cluster...")
     try:
         h2o.init(max_mem_size="4G", nthreads=-1, log_level="WARN")
-        state.set_status("initializing", "H2O cluster ready. Loading ridership data...")
+        STATE.set_status("initializing", "H2O ready. Loading data...")
     except Exception as e:
-        state.set_status("error", f"H2O init failed: {e}")
+        STATE.set_status("error", f"H2O init failed: {e}")
         return
 
-    ridership_path = Path("combined_ridership_2025_full.xlsx")
+    # Data Load
+    ridership_path = Path("combined_ridership_2025.csv")
     if not ridership_path.exists():
-        state.set_status("error", "Ridership file not found")
+        STATE.set_status("error", "CSV file not found")
         return
 
     try:
-        df = pd.read_excel(ridership_path)
+        df = pd.read_csv(ridership_path)
         df = df[df["DayType"] != "Total Trips"].copy()
         df = df.dropna(subset=["Ridership"])
         df["Month"] = df["Period"].astype(str).str[-2:].astype(int)
-
-        default_dest_map = (
-            df.groupby("Origin")["Destination"]
-            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
-            .to_dict()
-        )
-        global_dest = df["Destination"].mode().iloc[0]
-        origins = sorted(df["Origin"].dropna().astype(str).unique().tolist())
+        
+        origins = df["Origin"].unique().tolist()
         station_lookup = _build_station_lookup(origins)
+        default_dest_map = df.groupby("Origin")["Destination"].agg(lambda x: x.mode().iloc[0]).to_dict()
+        global_dest = df["Destination"].mode().iloc[0]
 
-        state.set_status("training", f"Training model on {len(df):,} rows...")
+        STATE.set_status("training", f"Training model on {len(df):,} rows...")
         hf = h2o.H2OFrame(df)
-        for col in ["Origin", "Destination", "DayType", "Month"]:
-            hf[col] = hf[col].asfactor()
-
-        aml = H2OAutoML(max_runtime_secs=90, seed=42, sort_metric="RMSE",
-                        exclude_algos=["DeepLearning"])  # Skip DL for speed
-        aml.train(x=["Origin", "Destination", "DayType", "Month"],
-                  y="Ridership", training_frame=hf)
+        for col in ["Origin", "Destination", "DayType", "Month"]: hf[col] = hf[col].asfactor()
+        
+        aml = H2OAutoML(max_runtime_secs=90, seed=42, sort_metric="RMSE", exclude_algos=["DeepLearning"])
+        aml.train(x=["Origin", "Destination", "DayType", "Month"], y="Ridership", training_frame=hf)
         model = aml.leader
-        state.set_status("training", f"Model ready: {model.model_id}")
+        STATE.set_status("running", "Model trained. Connecting to stream...")
     except Exception as e:
-        state.set_status("error", f"Model training failed: {e}")
+        STATE.set_status("error", f"Training failed: {e}")
         return
 
-    # ── Step 2: Connect Pub/Sub publisher + subscriber ──
-    publisher = subscriber = sub_future = None
-    try:
-        from google.cloud import pubsub_v1
-        from google.transit import gtfs_realtime_pb2
-
-        if creds:
+    # Pub/Sub Setup
+    publisher = None
+    topic_path = None
+    sub_client = None
+    if creds:
+        try:
             publisher = pubsub_v1.PublisherClient(credentials=creds)
             topic_path = publisher.topic_path(project_id, topic_id)
 
-            subscriber_client = pubsub_v1.SubscriberClient(credentials=creds)
-            sub_path = subscriber_client.subscription_path(project_id, sub_id)
-
             def _on_message(msg):
                 try:
-                    data = json.loads(msg.data.decode("utf-8"))
-                    vid = str(data.get("vehicle_id", "")).strip()
-                    if vid:
-                        vehicles[vid] = {
-                            "vehicle_id": vid,
-                            "route": data.get("route", ""),
-                            "trip_id": data.get("trip_id", ""),
-                            "lat": float(data.get("lat", 0)),
-                            "lon": float(data.get("lon", 0)),
-                            "timestamp": float(data.get("timestamp", time.time())),
-                        }
+                    # Handle JSON (from pub.py) or raw Protobuf
+                    try:
+                        data = json.loads(msg.data.decode("utf-8"))
+                        vid = str(data.get("vehicle_id", "")).strip()
+                        if vid:
+                            with vehicles_lock:
+                                vehicles[vid] = {
+                                    "vehicle_id": vid, "lat": float(data.get("lat", 0)),
+                                    "lon": float(data.get("lon", 0)), "route": data.get("route", ""),
+                                    "timestamp": float(data.get("timestamp", time.time())),
+                                }
+                            print(f"[pubsub] Received vehicle {vid} (JSON)")
+                    except:
+                        feed = gtfs_realtime_pb2.FeedMessage()
+                        feed.ParseFromString(msg.data)
+                        for entity in feed.entity:
+                            if entity.HasField("vehicle"):
+                                v = entity.vehicle
+                                vid = v.vehicle.id
+                                if vid:
+                                    with vehicles_lock:
+                                        vehicles[vid] = {
+                                            "vehicle_id": vid, "lat": v.position.latitude,
+                                            "lon": v.position.longitude, "route": v.trip.route_id,
+                                            "timestamp": float(v.timestamp or time.time()),
+                                        }
+                                    print(f"[pubsub] Received vehicle {vid} (Protobuf)")
                     msg.ack()
-                except Exception:
+                except:
                     msg.nack()
 
-            sub_future = subscriber_client.subscribe(sub_path, callback=_on_message)
-            state.set_status("running", "Connected to Pub/Sub")
-    except Exception as e:
-        state.set_status("running", f"Pub/Sub unavailable ({e}), using direct polling")
+            sub_client = pubsub_v1.SubscriberClient(credentials=creds)
+            sub_path = sub_client.subscription_path(project_id, sub_id)
+            sub_client.subscribe(sub_path, callback=_on_message)
+            STATE.set_status("running", f"Pub/Sub connected to {sub_id}. Connecting to stream...")
+            print(f"[pipeline] Pub/Sub listener started on {sub_id}")
+        except Exception as e:
+            STATE.set_status("running", f"Pub/Sub setup failed: {e}. Falling back to direct poll.")
+            print(f"[pipeline] Pub/Sub setup error: {e}")
+    else:
+        STATE.set_status("running", "No GCP credentials. Using direct 511 poll (check HF secrets if on Space).")
+        print("[pipeline] No credentials found. Pub/Sub disabled.")
 
-    # ── Step 3: Main loop ──
-    poll_url = f"https://api.511.org/Transit/VehiclePositions?api_key={api_key}&agency=BA"
+    # Main Loop
+    poll_api_key = os.environ.get("API_511_KEY", "c8565f6e-dae6-4779-8b1b-be266e3b0b6a")
+    poll_url = f"https://api.511.org/Transit/VehiclePositions?api_key={poll_api_key}&agency=RG"
     last_poll = 0
 
     while True:
         try:
             now = time.time()
-
-            # --- 3a. Poll 511.org every 30s ---
-            if now - last_poll >= 30:
+            # 1. Poll 511.org API directly every 65s (Rate limit: 60/hr)
+            if now - last_poll >= 65:
                 last_poll = now
                 try:
                     resp = requests.get(poll_url, timeout=15)
                     if resp.status_code == 200:
-                        # Publish raw bytes to Pub/Sub
-                        if publisher:
+                        raw = resp.content
+                        if raw.startswith(b'\xef\xbb\xbf'): raw = raw[3:]
+                        # Forward to Pub/Sub if available
+                        if publisher and topic_path:
                             try:
-                                publisher.publish(topic_path, resp.content)
-                            except Exception:
+                                publisher.publish(topic_path, raw)
+                            except:
                                 pass
-
-                        # Also parse locally for direct vehicle tracking
-                        try:
-                            feed = gtfs_realtime_pb2.FeedMessage()
-                            feed.ParseFromString(resp.content)
-                            for entity in feed.entity:
-                                if entity.HasField("vehicle"):
-                                    v = entity.vehicle
-                                    vid = v.vehicle.id
-                                    if vid:
+                        # Always parse directly so vehicles populate even without Pub/Sub
+                        feed = gtfs_realtime_pb2.FeedMessage()
+                        feed.ParseFromString(raw)
+                        for entity in feed.entity:
+                            if entity.HasField("vehicle"):
+                                v = entity.vehicle
+                                vid = v.vehicle.id
+                                if vid:
+                                    with vehicles_lock:
                                         vehicles[vid] = {
-                                            "vehicle_id": vid,
-                                            "route": v.trip.route_id,
-                                            "trip_id": v.trip.trip_id,
-                                            "lat": v.position.latitude,
-                                            "lon": v.position.longitude,
-                                            "timestamp": float(v.timestamp or now),
+                                            "vehicle_id": vid, "lat": v.position.latitude,
+                                            "lon": v.position.longitude, "route": v.trip.route_id,
+                                            "timestamp": now,
                                         }
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        with vehicles_lock:
+                            v_count = len(vehicles)
+                        print(f"[pipeline] Polled 511 API: {v_count} vehicles tracked")
+                    else:
+                        print(f"[pipeline] 511 API returned {resp.status_code}: {resp.text[:200]}")
+                        STATE.set_status("running (no live data)", f"511 API error {resp.status_code} — check API key")
+                except requests.exceptions.Timeout:
+                    print("[pipeline] 511 API timed out")
+                    STATE.set_status("running (no live data)", "511 API timed out — possible network block on HF Spaces")
+                except Exception as poll_err:
+                    print(f"[pipeline] 511 poll error: {poll_err}")
+                    STATE.set_status("running (no live data)", f"Poll error: {poll_err}")
 
-            # --- 3b. Prune stale vehicles (>5 min old) ---
-            cutoff = now - 300
-            stale = [vid for vid, v in vehicles.items() if v["timestamp"] < cutoff]
-            for vid in stale:
-                del vehicles[vid]
+            # 2. Prune
+            with vehicles_lock:
+                stale = [vid for vid, v in vehicles.items() if v["timestamp"] < now - 300]
+                for vid in stale: del vehicles[vid]
+                current_vehicles = list(vehicles.values())
 
-            # --- 3c. Build station predictions ---
+            # 3. Predict & Payload
             now_dt = dt.datetime.now()
             day_type = _day_type(now_dt)
             month_val = now_dt.month
-            cache_key = (day_type, month_val, now_dt.minute // 5)  # Cache per 5 min
+            cache_key = (day_type, month_val, now_dt.minute // 10)
 
             if cache_key not in prediction_cache and model:
-                rows = [
-                    {"Origin": o, "Destination": default_dest_map.get(o, global_dest),
-                     "DayType": day_type, "Month": int(month_val)}
-                    for o in station_lookup.keys()
-                ]
-                if rows:
-                    hf_in = h2o.H2OFrame(pd.DataFrame(rows))
-                    for col in ["Origin", "Destination", "DayType", "Month"]:
-                        hf_in[col] = hf_in[col].asfactor()
+                try:
+                    prows = [
+                        {"Origin": o, "Destination": default_dest_map.get(o, global_dest),
+                         "DayType": day_type, "Month": int(month_val)}
+                        for o in station_lookup.keys()
+                    ]
+                    hf_in = h2o.H2OFrame(pd.DataFrame(prows))
+                    for col in ["Origin", "Destination", "DayType", "Month"]: hf_in[col] = hf_in[col].asfactor()
                     preds = model.predict(hf_in).as_data_frame()
-                    prediction_cache[cache_key] = {
-                        rows[i]["Origin"]: max(0, float(preds.iloc[i]["predict"]))
-                        for i in range(len(rows))
-                    }
-                    # Keep only latest cache entry
-                    if len(prediction_cache) > 3:
-                        oldest = min(prediction_cache.keys())
-                        del prediction_cache[oldest]
+                    prediction_cache[cache_key] = { prows[i]["Origin"]: max(0, float(preds.iloc[i]["predict"])) for i in range(len(prows)) }
+                except: prediction_cache[cache_key] = {}
 
-            predictions = prediction_cache.get(cache_key, {})
-
-            # --- 3d. Compute live traffic per station ---
+            preds_dict = prediction_cache.get(cache_key, {})
             traffic_counts = {}
-            for v in vehicles.values():
+            agency_counts = {}
+            for v in current_vehicles:
+                # 1. Nearby Traffic
                 stn, km = _nearest_station(v["lat"], v["lon"])
-                if stn and km <= 3.0:
-                    traffic_counts[stn["name"]] = traffic_counts.get(stn["name"], 0) + 1
+                if stn and km <= 3.0: traffic_counts[stn["name"]] = traffic_counts.get(stn["name"], 0) + 1
+                
+                # 2. Improved Agency Distribution Logic
+                route = v.get("route", "")
+                agency = "Other"
+                if route:
+                    if ":" in route:
+                        agency = route.split(":")[0]
+                    elif any(p in route for p in ["YL-", "RD-", "GN-", "OR-", "BL-"]) or route in ["YL","RD","GN","OR","BL"]:
+                        agency = "BA" # BART
+                    elif route.isdigit():
+                        agency = "Muni/Bus"
+                    elif len(route) >= 2 and route[:2].isalpha():
+                        agency = route[:2] 
+                agency_counts[agency] = agency_counts.get(agency, 0) + 1
 
-            # --- 3e. Build stations payload ---
             stations_payload = []
             for origin_name, stn in station_lookup.items():
                 live = traffic_counts.get(stn["name"], 0)
-                predicted = predictions.get(origin_name, 0.0)
+                pred = preds_dict.get(origin_name, 0.0)
                 stations_payload.append({
-                    "origin": origin_name,
-                    "station_name": stn["name"],
-                    "station_abbr": stn["abbr"],
-                    "lat": stn["lat"],
-                    "lon": stn["lon"],
-                    "live_traffic_count": int(live),
-                    "predicted_ridership": round(predicted, 2),
-                    "footfall_score": round(predicted * (1 + 0.03 * live), 2),
+                    "origin": origin_name, "station_name": stn["name"], "station_abbr": stn["abbr"],
+                    "lat": stn["lat"], "lon": stn["lon"], "live_traffic_count": int(live),
+                    "predicted_ridership": round(pred, 2), "footfall_score": round(pred * (1 + 0.03 * live), 2),
                 })
-
             stations_payload.sort(key=lambda x: x["footfall_score"], reverse=True)
-
-            # --- 3f. Push to global state ---
-            state.update(list(vehicles.values()), stations_payload, day_type, month_val)
+            STATE.update(current_vehicles, stations_payload, day_type, month_val, agencies=agency_counts)
+            STATE.set_status("running", f"Tracking {len(current_vehicles)} Regional Vehicles | {len(station_lookup)} stations matched")
 
         except Exception as e:
-            state.set_status("error", str(e))
-
+            STATE.set_status("error", str(e))
         time.sleep(20)
 
-
-@st.cache_resource
-def start_pipeline():
-    """Start the background pipeline exactly once (survives Streamlit reruns)."""
-    state = get_state()
-    t = threading.Thread(target=_pipeline_worker, args=(state,), daemon=True, name="pipeline")
-    t.start()
-    return state
-
+# Start Thread
+threading.Thread(target=_pipeline_worker, daemon=True).start()
 
 # ============================================================
-# 6. Dashboard UI
+# 5. Dash UI (Premium Theme)
 # ============================================================
-def main():
-    state = start_pipeline()
-    snap = state.snapshot()
+COLORS = {"bg": "#0a0e1a", "card": "rgba(20, 27, 45, 0.85)", "text": "#e2e8f0"}
 
-    # --- Header ---
-    st.title("🚇 BART Footfall Intelligence Dashboard")
-    st.caption("Real-time transit traffic + ML ridership prediction powered by H2O AutoML")
+app = Dash(__name__, title="BART Intelligence")
+app.index_string = '''<!DOCTYPE html><html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet"><style>
+body { font-family: 'Inter', sans-serif; background: #0a0e1a; color: #e2e8f0; margin: 0; }
+.metric-card { background: rgba(20, 27, 45, 0.85); border: 1px solid rgba(99, 140, 255, 0.2); border-radius: 12px; padding: 20px; text-align: center; }
+.metric-label { font-size: 11px; text-transform: uppercase; color: #94a3b8; margin-bottom: 5px; }
+.metric-value { font-size: 28px; font-weight: 800; font-family: 'JetBrains Mono'; }
+.section-card { background: rgba(20, 27, 45, 0.7); border-radius: 12px; padding: 20px; border: 1px solid rgba(255,255,255,0.05); }
+.header { padding: 30px 40px; display: flex; justify-content: space-between; align-items: center; }
+.title { font-size: 24px; font-weight: 800; background: linear-gradient(90deg, #638cff, #ffb347); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.status-badge { padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 600; background: rgba(99,140,255,0.1); color: #638cff; border: 1px solid rgba(99,140,255,0.2); }
+.detail-card { background: linear-gradient(135deg, rgba(99, 140, 255, 0.1), rgba(255, 179, 71, 0.05)); border-radius: 12px; padding: 20px; border: 1px solid rgba(255,255,255,0.1); }
+.dropdown-custom .Select-control { background-color: rgba(20, 27, 45, 0.9); border: 1px solid rgba(255,255,255,0.1); color: white; }
+.dropdown-custom .Select-menu-outer { background-color: #1a1f2e; color: white; }
+</style></head><body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>'''
 
-    # --- Status Bar ---
-    status = snap["status"]
-    if status == "initializing":
-        st.info(f"⏳ **Initializing:** {snap['status_detail']}")
-        time.sleep(3)
-        st.rerun()
-    elif status == "training":
-        st.warning(f"🧠 **Training Model:** {snap['status_detail']}")
-        time.sleep(5)
-        st.rerun()
-    elif status == "error":
-        st.error(f"❌ **Error:** {snap['status_detail']}")
-        time.sleep(10)
-        st.rerun()
+app.layout = html.Div([
+    dcc.Interval(id="ui-refresh", interval=10_000, n_intervals=0),
+    html.Div([
+        html.Div([
+            html.Div("BART Footfall Intelligence", className="title"),
+            html.Div("Real-time Predictions & Transit Analytics", style={"fontSize": "13px", "color": "#94a3b8"})
+        ]),
+        html.Div(id="ui-status", className="status-badge")
+    ], className="header"),
+    
+    html.Div([
+        html.Div(id="ui-metrics", style={"display":"grid", "gridTemplateColumns":"repeat(4, 1fr)", "gap":"20px", "marginBottom":"20px"}),
+        
+        html.Div([
+            html.Div([
+                html.Div("System Controls", style={"fontWeight":"bold", "marginBottom":"10px", "fontSize":"13px", "color":"#94a3b8"}),
+                dcc.Dropdown(id="ui-station-select", placeholder="Select or Search Station...", className="dropdown-custom"),
+                html.Div(id="ui-station-details", style={"marginTop":"20px"})
+            ], className="section-card", style={"flex":"1"}),
+            html.Div([
+                html.Div("Live Regional Connection Hubs", style={"fontWeight":"bold", "marginBottom":"15px"}),
+                dcc.Graph(id="ui-agency-chart", style={"height":"200px"}, config={"displayModeBar":False})
+            ], className="section-card", style={"flex":"1.5"})
+        ], style={"display":"flex", "gap":"20px", "marginBottom":"20px"}),
+        
+        html.Div([
+            html.Div([
+                html.Div("Live Traffic & Forecast Map", style={"fontWeight":"bold", "marginBottom":"15px"}),
+                dcc.Graph(id="ui-map", style={"height":"500px"}, config={"displayModeBar":False})
+            ], className="section-card", style={"flex":"2"}),
+            html.Div([
+                html.Div("Top Stations", style={"fontWeight":"bold", "marginBottom":"15px"}),
+                html.Div(id="ui-table")
+            ], className="section-card", style={"flex":"1"})
+        ], style={"display":"flex", "gap":"20px"})
+    ], style={"padding":"0 40px 40px"})
+])
 
-    # --- Metrics Row ---
-    last_upd = snap["last_update"]
-    age_str = "N/A"
-    if last_upd:
-        age = (dt.datetime.now(dt.timezone.utc) - last_upd).total_seconds()
-        age_str = f"{int(age)}s ago"
+@app.callback(
+    [Output("ui-map", "figure"), Output("ui-table", "children"), Output("ui-metrics", "children"), 
+     Output("ui-status", "children"), Output("ui-station-select", "options"), 
+     Output("ui-station-details", "children"), Output("ui-agency-chart", "figure")],
+    [Input("ui-refresh", "n_intervals"), Input("ui-station-select", "value")]
+)
+def update_ui(n, selected_station):
+    snap = STATE.snapshot()
+    stations = snap.get("stations", [])
+    v_count = snap.get("vehicle_count", 0)
+    t_traffic = snap.get("total_traffic", 0)
+    t_predicted = snap.get("total_predicted", 0.0)
+    agencies = snap.get("agencies", {})
+    
+    # Options
+    options = [{"label": s["station_name"], "value": s["origin"]} for s in sorted(stations, key=lambda x: x["station_name"])]
+    
+    # 1. Map
+    map_fig = go.Figure()
+    if stations:
+        df = pd.DataFrame(stations)
+        # Standard scatter for better control
+        map_fig.add_trace(go.Scattermapbox(
+            lat=df["lat"], lon=df["lon"], mode="markers",
+            marker=go.scattermapbox.Marker(
+                size=12, color=df["footfall_score"], colorscale="YlOrRd", showscale=True,
+                colorbar=dict(title="Score", thickness=15, x=1.02, tickcolor="white", tickfont=dict(color="white"))
+            ),
+            text=df.apply(lambda r: f"{r['station_name']}<br>Live: {r['live_traffic_count']}<br>Pred: {r['predicted_ridership']}", axis=1),
+            hoverinfo="text"
+        ))
+    
+    map_layout = dict(
+        mapbox=dict(style="carto-darkmatter", center=dict(lat=37.77, lon=-122.27), zoom=9),
+        margin={"r":0,"t":0,"l":0,"b":0}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
+    )
+    if selected_station:
+        stn = next((s for s in stations if s["origin"] == selected_station), None)
+        if stn:
+            map_layout["mapbox"]["center"] = {"lat": stn["lat"], "lon": stn["lon"]}
+            map_layout["mapbox"]["zoom"] = 13
+    map_fig.update_layout(map_layout)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🚌 Live Vehicles", f"{snap['vehicle_count']:,}")
-    c2.metric("🚉 Stations", f"{len(snap['stations']):,}")
-    c3.metric("📊 Live Traffic", f"{snap['total_traffic']:,}")
-    c4.metric("🔮 Predicted Ridership", f"{snap['total_predicted']:,.0f}")
-    c5.metric("⏱ Last Update", age_str)
+    # 2. Table
+    # Using simple HTML table for stability
+    table_rows = [html.Tr([html.Th(c, style={"textAlign":"right" if c in ["Live","Pred","Score"] else "left"}) for c in ["Station", "Live", "Pred", "Score"]])]
+    for s in stations[:10]:
+        table_rows.append(html.Tr([
+            html.Td(s["station_name"]),
+            html.Td(s["live_traffic_count"], style={"textAlign":"right"}),
+            html.Td(int(s["predicted_ridership"]), style={"textAlign":"right"}),
+            html.Td(s["footfall_score"], style={"textAlign":"right", "fontWeight":"bold", "color":"#638cff"})
+        ]))
+    table = html.Table(table_rows, style={"width":"100%", "color":"white", "fontSize":"12px"})
 
-    st.markdown(
-        f"**Day Type:** {snap['day_type']}  •  **Month:** {snap['month']}  •  "
-        f"**Status:** {snap['status']}"
+    # 3. Metrics
+    metrics = [
+        html.Div([html.Div("LIVE VEHICLES", className="metric-label"), html.Div(v_count, className="metric-value")], className="metric-card"),
+        html.Div([html.Div("STATIONS", className="metric-label"), html.Div(len(stations), className="metric-value")], className="metric-card"),
+        html.Div([html.Div("CURRENT TRAFFIC", className="metric-label"), html.Div(t_traffic, className="metric-value")], className="metric-card"),
+        html.Div([html.Div("TOTAL PREDICTED", className="metric-label"), html.Div(f"{int(t_predicted):,}", className="metric-value")], className="metric-card")
+    ]
+    
+    # 4. Station Details
+    details = html.Div("Select a station to view details", style={"color":"#94a3b8", "fontSize":"12px", "fontStyle":"italic", "padding":"10px"})
+    if selected_station:
+        s = next((s for s in stations if s["origin"] == selected_station), None)
+        if s:
+            details = html.Div([
+                html.Div(s["station_name"], style={"fontSize":"18px", "fontWeight":"bold", "color":"#638cff", "marginBottom":"15px"}),
+                html.Div([
+                    html.Div([
+                        html.Div("LIVE TRAFFIC", style={"fontSize":"10px", "color":"#94a3b8"}),
+                        html.Div(s["live_traffic_count"], style={"fontSize":"20px", "fontWeight":"bold", "color":"#47ffa5"})
+                    ], style={"flex":"1"}),
+                    html.Div([
+                        html.Div("BASELINE PRED", style={"fontSize":"10px", "color":"#94a3b8"}),
+                        html.Div(int(s["predicted_ridership"]), style={"fontSize":"20px", "fontWeight":"bold"})
+                    ], style={"flex":"1"})
+                ], style={"display":"flex", "marginBottom":"15px"}),
+                html.Div([
+                    html.Div("FOOTFALL SCORE", style={"fontSize":"10px", "color":"#94a3b8"}),
+                    html.Div(s["footfall_score"], style={"fontSize":"24px", "fontWeight":"800", "color":"#ffb347"})
+                ])
+            ], className="detail-card")
+
+    # 5. Live Hubs Chart (Replaces Agency Chart)
+    agency_fig = go.Figure()
+    if stations:
+        # Sort by live traffic to identify hubs
+        hub_stations = sorted(stations, key=lambda x: x["live_traffic_count"], reverse=True)[:10]
+        # Only show if there is actually traffic
+        hub_stations = [s for s in hub_stations if s["live_traffic_count"] > 0]
+        
+        if hub_stations:
+            agency_fig.add_trace(go.Bar(
+                x=[s["station_name"] for s in hub_stations],
+                y=[s["live_traffic_count"] for s in hub_stations],
+                marker_color="#47ffa5",
+                text=[f"{s['live_traffic_count']}" for s in hub_stations],
+                textposition='auto',
+            ))
+    
+    agency_fig.update_layout(
+        margin={"r":10,"t":10,"l":10,"b":30}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color":"white"}, xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
     )
 
-    # --- Station Footfall Map ---
-    stations_df = pd.DataFrame(snap["stations"])
-    vehicles_df = pd.DataFrame(snap["vehicles"])
-
-    if not stations_df.empty:
-        left, right = st.columns([2, 1])
-
-        with left:
-            st.subheader("Station Footfall Forecast")
-            fig = px.scatter_mapbox(
-                stations_df, lat="lat", lon="lon",
-                size="predicted_ridership", color="live_traffic_count",
-                hover_name="station_name",
-                hover_data={
-                    "station_abbr": True, "origin": True,
-                    "predicted_ridership": ":,.0f", "live_traffic_count": True,
-                    "footfall_score": ":,.0f", "lat": False, "lon": False,
-                },
-                zoom=8.7, center={"lat": 37.77, "lon": -122.27},
-                color_continuous_scale="YlOrRd", size_max=35,
-                mapbox_style="open-street-map",
-            )
-            fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0}, height=550)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with right:
-            st.subheader("Top Stations")
-            if not stations_df.empty:
-                top = (
-                    stations_df[["station_name", "live_traffic_count",
-                                 "predicted_ridership", "footfall_score"]]
-                    .sort_values("footfall_score", ascending=False)
-                    .head(15)
-                    .reset_index(drop=True)
-                )
-                top.index = top.index + 1
-                st.dataframe(top, use_container_width=True, height=510)
-
-    # --- Live Vehicle Map ---
-    if not vehicles_df.empty:
-        st.subheader("Live Vehicle Overlay")
-        fig_v = px.scatter_mapbox(
-            vehicles_df, lat="lat", lon="lon", color="route",
-            hover_name="vehicle_id",
-            hover_data={"trip_id": True, "lat": ":.5f", "lon": ":.5f"},
-            zoom=8.7, center={"lat": 37.77, "lon": -122.27},
-            mapbox_style="carto-positron",
-        )
-        fig_v.update_layout(
-            margin={"l": 0, "r": 0, "t": 0, "b": 0}, height=450,
-            legend_title_text="Route",
-        )
-        st.plotly_chart(fig_v, use_container_width=True)
-    elif snap["status"] == "running":
-        st.info("No live vehicles detected yet. Waiting for data stream...")
-
-    # --- Footer ---
-    st.divider()
-    st.caption("Auto-refreshes every 15 seconds. Powered by 511.org GTFS-RT, Google Cloud Pub/Sub, and H2O AutoML.")
-
-    # --- Auto-refresh ---
-    time.sleep(15)
-    st.rerun()
-
+    return map_fig, table, metrics, f"{snap['status'].upper()} | {snap['status_detail']}", options, details, agency_fig
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=7860)
